@@ -1,0 +1,5 @@
+{
+  "installCommand": "npm install --prefix motor-vibe-dashboard",
+  "buildCommand": "npm run build --prefix motor-vibe-dashboard",
+  "outputDirectory": "motor-vibe-dashboard/dist"
+}
