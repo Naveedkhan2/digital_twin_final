@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3-Phase Motor - Diagnostic Lab</title>
+    <style>
+        body { margin: 0; background: #121212; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        
+        #ui-panel { 
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%); 
+            z-index: 2000; text-align: center; width: auto; pointer-events: none;
+        }
+        h1 { 
+            color: #00f2ff; margin: 0; font-size: 24px; 
+            text-shadow: 0 0 10px rgba(0, 242, 255, 0.4); 
+            white-space: nowrap; letter-spacing: 2px;
+        }
+        p { color: #ffffff; margin: 5px 0 10px 0; font-size: 10px; letter-spacing: 3px; font-weight: bold; opacity: 0.7; }
+        .controls-hint { color: #a4b1bc; font-size: 10px; margin-bottom: 10px; }
+
+        #speed-panel {
+            position: absolute; bottom: 30px; right: 30px;
+            background: rgba(20, 25, 30, 0.9); border: 1px solid #00f2ff;
+            padding: 15px; border-radius: 8px; z-index: 2000;
+            color: #00f2ff; width: 220px; box-shadow: 0 0 15px rgba(0, 242, 255, 0.2);
+        }
+        .slider-label { font-size: 12px; font-weight: bold; display: block; margin-bottom: 10px; text-transform: uppercase; }
+        input[type=range] { width: 100%; cursor: pointer; accent-color: #00f2ff; }
+        #rpm-val { color: #fff; float: right; }
+
+        .btn-group { display: flex; gap: 12px; pointer-events: auto; justify-content: center; }
+        .toggle-btn {
+            padding: 8px 20px; background: rgba(255, 255, 255, 0.05);
+            border: 1px solid #00f2ff; color: #00f2ff; font-weight: bold;
+            text-transform: uppercase; cursor: pointer; border-radius: 3px;
+            transition: all 0.3s ease; font-size: 12px;
+        }
+        .toggle-btn:hover { background: #00f2ff; color: #1a1f24; }
+        .active-btn { background: #00f2ff; color: #1a1f24; box-shadow: 0 0 15px rgba(0, 242, 255, 0.3); }
+        
+        #pwrBtn { border-color: #ff3e3e; color: #ff3e3e; }
+        #pwrBtn.motor-on { border-color: #00ff88; color: #00ff88; box-shadow: 0 0 10px rgba(0, 255, 136, 0.2); }
+        #pwrBtn.motor-on:hover { background: #00ff88; color: #1a1f24; }
+        #pwrBtn:not(.motor-on):hover { background: #ff3e3e; color: #1a1f24; }
+
+        #neon-tooltip {
+            position: fixed; display: none; pointer-events: none;
+            background: rgba(10, 15, 20, 0.95); border: 1px solid #00f2ff;
+            color: #00f2ff; padding: 12px; font-family: 'Consolas', monospace;
+            font-size: 12px; z-index: 3000; border-radius: 4px;
+            box-shadow: 0 0 20px rgba(0, 242, 255, 0.2); min-width: 180px;
+        }
+        .data-val { color: #ffffff; float: right; margin-left: 10px; }
+        .status-ok { color: #00ff88; font-weight: bold; }
+        .status-off { color: #ff3e3e; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-panel">
+        <h1>MOTOR DIAGNOSTICS</h1>
+        <p>SYSTEM STATUS: <span id="sys-status" class="status-off">OFFLINE</span></p>
+        <div class="controls-hint">W,A,S,D: NAVIGATE | HOVER: IDENTIFY | CLICK: DIAGNOSTIC DATA</div>
+        <div class="btn-group">
+            <button id="pwrBtn" class="toggle-btn" onclick="togglePower()">Power ON</button>
+            <button id="bpBtn" class="toggle-btn" onclick="toggleView()">Blueprint</button>
+            <button id="explodeBtn" class="toggle-btn" onclick="toggleExplode()">Explode</button>
+        </div>
+    </div>
+
+    <div id="speed-panel">
+        <label class="slider-label">VFD Speed Control: <span id="rpm-val">1450</span> RPM</label>
+        <input type="range" id="rpmSlider" min="0" max="3000" value="1450" oninput="updateSpeedDisplay(this.value)">
+    </div>
+
+    <div id="neon-tooltip"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+
+    <script>
+        let scene, camera, renderer, controls;
+        let mainMotor = null, hoveredObject = null;
+        let materialsMap = new Map(), originalPositions = new Map();
+        
+        let isMotorRunning = false;
+        let targetSpeed = 0; 
+        let currentMotorSpeed = 0; 
+        let rotationTime = 0;
+
+        const MOTOR_REF = "motor01";
+        const POLES = 4;
+        /** Same defaults as motor-vibe-dashboard/src/firebase/config.ts — override via URL hash if needed */
+        const FIREBASE_CFG = {
+            apiKey: "AIzaSyCJWIGi5cXVbRmNre0pYPZmGnehnVWEUvs",
+            authDomain: "motor-f8005.firebaseapp.com",
+            databaseURL: "https://motor-f8005-default-rtdb.asia-southeast1.firebasedatabase.app",
+            projectId: "motor-f8005",
+            storageBucket: "motor-f8005.firebasestorage.app",
+            messagingSenderId: "989674439785",
+            appId: "1:989674439785:web:1390a9bb3ff2b6e2f8cef8",
+        };
+
+        let liveReadingFlat = null;
+        let latestLogFlat = null;
+
+        const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+        const tooltip = document.getElementById('neon-tooltip');
+        const keys = { w: false, a: false, s: false, d: false };
+        const outlineMat = new THREE.MeshBasicMaterial({ color: 0x00f2ff, side: THREE.BackSide, transparent: true, opacity: 0.9 });
+
+        function flattenLiveReading(lr) {
+            if (!lr || typeof lr !== "object") return null;
+            const hasSignal =
+                lr.current != null ||
+                typeof lr.frequency === "number" ||
+                typeof lr.vibration === "number" ||
+                lr.temperature != null ||
+                lr.voltage != null;
+            if (!hasSignal) return null;
+            const hz = typeof lr.frequency === "number" ? lr.frequency : 50;
+            return {
+                I1: lr.current?.I1 ?? 0,
+                I2: lr.current?.I2 ?? 0,
+                I3: lr.current?.I3 ?? 0,
+                V1: lr.voltage?.V1 ?? 400,
+                V2: lr.voltage?.V2 ?? 400,
+                V3: lr.voltage?.V3 ?? 400,
+                frequency: hz,
+                T1: lr.temperature?.T1 ?? 55,
+                T2: lr.temperature?.T2 ?? 50,
+                vibration: typeof lr.vibration === "number" ? lr.vibration : 2.5,
+            };
+        }
+
+        function sortLogKeys(keys) {
+            return [...keys].filter((k) => k !== "entry_live").sort((a, b) => {
+                const na = parseInt(String(a).replace("entry_", ""), 10);
+                const nb = parseInt(String(b).replace("entry_", ""), 10);
+                if (!isNaN(na) && !isNaN(nb)) return na - nb;
+                return String(a).localeCompare(String(b));
+            });
+        }
+
+        function latestFromLogs(val) {
+            if (!val || typeof val !== "object") return null;
+            const ks = sortLogKeys(Object.keys(val));
+            if (ks.length === 0) return null;
+            const last = val[ks[ks.length - 1]];
+            if (!last || typeof last !== "object") return null;
+            return {
+                I1: last.I1 ?? 0,
+                I2: last.I2 ?? 0,
+                I3: last.I3 ?? 0,
+                V1: last.V1 ?? 400,
+                V2: last.V2 ?? 400,
+                V3: last.V3 ?? 400,
+                frequency: typeof last.frequency === "number" ? last.frequency : 50,
+                T1: last.T1 ?? 55,
+                T2: last.T2 ?? 50,
+                vibration: typeof last.vibration === "number" ? last.vibration : 2.5,
+            };
+        }
+
+        function getFirebaseBase() {
+            if (liveReadingFlat) return liveReadingFlat;
+            return latestLogFlat;
+        }
+
+        function syncRpmFromHz(hz) {
+            return (120 / POLES) * Math.max(hz || 0, 0);
+        }
+
+        function initFirebase() {
+            try {
+                if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CFG);
+                const db = firebase.database();
+                db.ref(`${MOTOR_REF}/live_reading`).on("value", (snap) => {
+                    const v = snap.val();
+                    liveReadingFlat = flattenLiveReading(v);
+                });
+                db.ref(`${MOTOR_REF}/logs`).on("value", (snap) => {
+                    latestLogFlat = latestFromLogs(snap.val());
+                });
+            } catch (e) {
+                console.warn("[Firebase]", e);
+            }
+        }
+
+        function getEffectiveRpm() {
+            if (!isMotorRunning) return 0;
+            return Math.round((currentMotorSpeed / 0.3) * 3000);
+        }
+
+        /** Speed ratio vs Firebase baseline (synchronous speed from stored frequency). Clamped for stability. */
+        function getRpmRatio(effectiveRpm) {
+            if (!isMotorRunning) return 0;
+            const base = getFirebaseBase();
+            const refHz = base && base.frequency > 0.1 ? base.frequency : 50;
+            const refRpm = Math.max(syncRpmFromHz(refHz), 30);
+            return Math.min(Math.max(effectiveRpm / refRpm, 0), 1.85);
+        }
+
+        function syntheticLoadFactor(effectiveRpm) {
+            if (!isMotorRunning) return 0;
+            return Math.min(Math.max(effectiveRpm / 3000, 0), 1);
+        }
+
+        function currentForPart(part, I1, I2, I3) {
+            const n = (part.userData.name || "").toUpperCase();
+            if (n.includes("WINDING A")) return I1;
+            if (n.includes("WINDING B")) return I2;
+            return (I1 + I2 + I3) / 3;
+        }
+
+        function tempForPart(part, T1, T2) {
+            const n = (part.userData.name || "").toUpperCase();
+            if (n.includes("WINDING A")) return T1;
+            if (n.includes("WINDING B")) return T2;
+            return (T1 + T2) / 2;
+        }
+
+        init();
+        initFirebase();
+        createEnvironment();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x121212);
+            
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.set(40, 25, 50);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 0, 0);
+            controls.enableDamping = true;
+            
+            const ambient = new THREE.AmbientLight(0xffffff, 0.7);
+            scene.add(ambient);
+            
+            const mainLight = new THREE.DirectionalLight(0xffffff, 1.0);
+            mainLight.position.set(50, 100, 50);
+            mainLight.castShadow = true;
+            scene.add(mainLight);
+
+            const fillLight = new THREE.PointLight(0x00f2ff, 0.4);
+            fillLight.position.set(-30, 20, -30);
+            scene.add(fillLight);
+        }
+
+        function createEnvironment() {
+            const grid = new THREE.GridHelper(200, 20, 0x333333, 0x222222);
+            grid.position.y = -8; 
+            scene.add(grid);
+
+            mainMotor = createDetailedMotor();
+            mainMotor.position.set(0, 0, 0);
+            mainMotor.userData.isExploded = false;
+            mainMotor.userData.isBlueprint = false;
+            scene.add(mainMotor);
+        }
+
+        function createDetailedMotor() {
+            const motorGroup = new THREE.Group();
+            
+            const frameMat = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, metalness: 0.6, roughness: 0.3 }); 
+            const endShieldMat = new THREE.MeshStandardMaterial({ color: 0x999999, metalness: 0.7, roughness: 0.4 }); 
+            const rotorMat = new THREE.MeshStandardMaterial({ color: 0x666666, metalness: 0.8, roughness: 0.5 }); 
+            const copperMat = new THREE.MeshStandardMaterial({ color: 0xd97706, metalness: 0.7, roughness: 0.3 });
+            const fanMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.5, roughness: 0.2 });
+            const darkMat = new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.3, roughness: 0.6 });
+            const steelMat = new THREE.MeshStandardMaterial({ color: 0xd1d5db, metalness: 0.9, roughness: 0.1 });
+
+            const addPart = (geo, mat, props) => {
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(props.px || 0, props.py || 0, props.pz || 0);
+                if(props.rx) mesh.rotation.x = props.rx;
+                if(props.ry) mesh.rotation.y = props.ry;
+                if(props.rz) mesh.rotation.z = props.rz;
+                
+                mesh.userData = { id: props.id, name: props.name, params: props.params || null };
+                
+                const outline = new THREE.Mesh(geo, outlineMat);
+                outline.scale.multiplyScalar(1.05); 
+                outline.visible = false;
+                mesh.add(outline);
+                mesh.userData.outline = outline;
+
+                mesh.castShadow = mesh.receiveShadow = true;
+                motorGroup.add(mesh);
+                materialsMap.set(mesh, mat);
+                originalPositions.set(mesh, mesh.position.clone());
+                return mesh;
+            };
+
+            // Stator and Ribs
+            addPart(new THREE.CylinderGeometry(4, 4, 10, 32, 1, true), frameMat, { rz: Math.PI/2, id: 'frame', name: 'STATOR FRAME', params: ['TEMP'] });
+            for (let i = 0; i < 24; i++) {
+                const a = (i/24)*Math.PI*2;
+                addPart(new THREE.BoxGeometry(10, 0.8, 0.1), frameMat, { py: Math.cos(a)*4.1, pz: Math.sin(a)*4.1, rx: -a, id: 'rib', name: 'COOLING RIB', params: ['TEMP'] });
+            }
+            
+            // Windings
+            addPart(new THREE.TorusGeometry(3.2, 0.4, 16, 50), copperMat, { px: 4, ry: Math.PI/2, id: 'coil', name: 'COPPER WINDING A', params: ['CURRENT', 'TEMP'] });
+            addPart(new THREE.TorusGeometry(3.2, 0.4, 16, 50), copperMat, { px: -4, ry: Math.PI/2, id: 'coil', name: 'COPPER WINDING B', params: ['CURRENT', 'TEMP'] });
+            
+            // Rotor and Shaft
+            const rotor = addPart(new THREE.CylinderGeometry(2.8, 2.8, 8, 24), rotorMat, { rz: Math.PI/2, id: 'rotor', name: 'ROTOR CORE', params: ['VIBRATION', 'FREQ', 'RPM'] });
+            rotor.name = "active_part";
+            const s = addPart(new THREE.CylinderGeometry(0.6, 0.6, 22, 32), steelMat, { rz: Math.PI/2, id: 'shaft', name: 'DRIVE SHAFT', params: ['VIBRATION', 'RPM'] });
+            s.name = "active_part";
+            
+            // End Shields
+            addPart(new THREE.CylinderGeometry(4.2, 4.2, 1, 32), endShieldMat, { px: 5, rz: Math.PI/2, id: 'bell', name: 'END SHIELD A', params: ['VIBRATION', 'TEMP'] });
+            addPart(new THREE.CylinderGeometry(4.2, 4.2, 1, 32), endShieldMat, { px: -5, rz: Math.PI/2, id: 'bell', name: 'END SHIELD B', params: ['VIBRATION', 'TEMP'] });
+
+            // Bearings (Acoustic parameter removed here)
+            const createBearing = (xPos, suffix) => {
+                const ballGeo = new THREE.SphereGeometry(0.25, 12, 12);
+                const bParams = ['VIBRATION', 'TEMP']; // Acoustic parameter removed
+                addPart(new THREE.TorusGeometry(1.1, 0.2, 16, 50), steelMat, { px: xPos, ry: Math.PI/2, id: 'bearing', name: `BEARING OUTER RACE ${suffix}`, params: bParams });
+                const innerRace = addPart(new THREE.TorusGeometry(0.7, 0.15, 16, 50), steelMat, { px: xPos, ry: Math.PI/2, id: 'bearing', name: `BEARING INNER RACE ${suffix}`, params: bParams });
+                innerRace.name = "active_part";
+                for(let i=0; i<8; i++) {
+                    const angle = (i/8) * Math.PI * 2;
+                    const ball = addPart(ballGeo, steelMat, { px: xPos, py: Math.cos(angle)*0.9, pz: Math.sin(angle)*0.9, id: 'bearing', name: `BEARING BALL ${suffix}`, params: bParams });
+                    ball.name = "active_part";
+                    ball.userData.orbitAngle = angle;
+                }
+            };
+            createBearing(6.5, 'A');
+            createBearing(-6.5, 'B');
+
+            // Bearing Caps (Acoustic parameter removed here)
+            const capParams = ['VIBRATION', 'TEMP']; // Acoustic parameter removed
+            addPart(new THREE.CylinderGeometry(1.5, 1.5, 0.4, 32), darkMat, { px: 5.5, rz: Math.PI/2, id: 'b_cap', name: 'BEARING CAP A', params: capParams });
+            addPart(new THREE.CylinderGeometry(1.5, 1.5, 0.4, 32), darkMat, { px: -5.5, rz: Math.PI/2, id: 'b_cap', name: 'BEARING CAP B', params: capParams });
+            
+            // Fan
+            for(let i=0; i<6; i++) {
+                const f = addPart(new THREE.BoxGeometry(0.2, 6, 1.5), fanMat, { px: -8.5, rx: (i*Math.PI)/3, id: 'fan', name: 'FAN BLADE' });
+                f.name = "active_part";
+            }
+            
+            addPart(new THREE.CylinderGeometry(3.8, 4.3, 4, 32, 1, true), frameMat, { px: -10, rz: Math.PI/2, id: 'cover', name: 'FAN COVER', params: ['VIBRATION'] });
+            addPart(new THREE.BoxGeometry(3.5, 2, 3.5), darkMat, { py: 4.8, id: 'box', name: 'TERMINAL BOX', params: ['CURRENT', 'FREQ'] });
+            addPart(new THREE.BoxGeometry(8, 0.8, 1.8), darkMat, { py: -4.2, pz: 3.5, id: 'base', name: 'MOUNTING BASE', params: ['VIBRATION'] });
+
+            return motorGroup;
+        }
+
+        function getDiagnosticHTML(part) {
+            let html = `<strong style="color:#00f2ff">${part.userData.name}</strong><br><hr style="border:0;border-top:1px solid #333">`;
+            const params = part.userData.params;
+            if (!params) return html + "NO SENSOR DATA";
+
+            const effectiveRpm = getEffectiveRpm();
+            const base = getFirebaseBase();
+            const ratio = getRpmRatio(effectiveRpm);
+            const demo = syntheticLoadFactor(effectiveRpm);
+            const vibPow = 1.25;
+
+            params.forEach((p) => {
+                let label = "";
+                let val = "";
+
+                if (base) {
+                    const I1 = base.I1, I2 = base.I2, I3 = base.I3;
+                    const T1 = base.T1, T2 = base.T2;
+                    const hz0 = base.frequency;
+                    const v0 = base.vibration;
+
+                    switch (p) {
+                        case "TEMP":
+                            label = "Temperature";
+                            {
+                                const t0 = tempForPart(part, T1, T2);
+                                const t = isMotorRunning
+                                    ? 25 + Math.max(0, t0 - 25) * ratio
+                                    : 25 + Math.max(0, t0 - 25) * 0.12;
+                                val = t.toFixed(1) + "°C";
+                            }
+                            break;
+                        case "CURRENT":
+                            label = "Current";
+                            {
+                                const i0 = currentForPart(part, I1, I2, I3);
+                                const i = isMotorRunning ? i0 * ratio : i0 * 0.02;
+                                val = i.toFixed(2) + " A";
+                            }
+                            break;
+                        case "FREQ":
+                            label = "Frequency";
+                            {
+                                const f = isMotorRunning ? hz0 * ratio : 0;
+                                val = f.toFixed(2) + " Hz";
+                            }
+                            break;
+                        case "VIBRATION":
+                            label = "Vibration";
+                            {
+                                const v = isMotorRunning ? v0 * Math.pow(ratio, vibPow) : v0 * 0.05;
+                                val = v.toFixed(3) + " mm/s";
+                            }
+                            break;
+                        case "RPM":
+                            label = "Speed";
+                            val = effectiveRpm + " RPM";
+                            break;
+                    }
+                } else {
+                    switch (p) {
+                        case "TEMP":
+                            label = "Temperature";
+                            val = (25 + demo * 38).toFixed(1) + "°C";
+                            break;
+                        case "CURRENT":
+                            label = "Current";
+                            val = (isMotorRunning ? 2.45 + demo * 70 : 0).toFixed(2) + " A";
+                            break;
+                        case "FREQ":
+                            label = "Frequency";
+                            val = (demo * 50).toFixed(2) + " Hz";
+                            break;
+                        case "VIBRATION":
+                            label = "Vibration";
+                            val = (demo * 2.8).toFixed(3) + " mm/s";
+                            break;
+                        case "RPM":
+                            label = "Speed";
+                            val = effectiveRpm + " RPM";
+                            break;
+                    }
+                }
+                html += `<div>${label}: <span class="data-val">${val}</span></div>`;
+            });
+            return html;
+        }
+
+        function postDriveToParent() {
+            try {
+                if (window.parent !== window) {
+                    window.parent.postMessage({
+                        type: 'DRIVE_LOCAL',
+                        motorOn: isMotorRunning,
+                        rpmSetpoint: parseInt(String(document.getElementById('rpmSlider').value), 10),
+                    }, '*');
+                }
+            } catch (_) {}
+        }
+
+        function applyDriveSync(motorOn, rpm) {
+            const r = Math.max(0, Math.min(3000, Number(rpm) || 0));
+            isMotorRunning = !!motorOn;
+            const btn = document.getElementById('pwrBtn');
+            const status = document.getElementById('sys-status');
+            const slider = document.getElementById('rpmSlider');
+            slider.value = String(r);
+            document.getElementById('rpm-val').innerText = String(r);
+            if (isMotorRunning) {
+                btn.innerText = "Power OFF";
+                btn.classList.add('motor-on');
+                status.innerText = "OPERATIONAL";
+                status.className = "status-ok";
+                targetSpeed = (r / 3000) * 0.3;
+            } else {
+                btn.innerText = "Power ON";
+                btn.classList.remove('motor-on');
+                status.innerText = "OFFLINE";
+                status.className = "status-off";
+                targetSpeed = 0;
+            }
+        }
+
+        window.addEventListener('message', (e) => {
+            if (e.data && e.data.type === 'DRIVE_SYNC') {
+                applyDriveSync(e.data.motorOn, e.data.rpmSetpoint);
+            }
+        });
+
+        function togglePower() {
+            isMotorRunning = !isMotorRunning;
+            const btn = document.getElementById('pwrBtn');
+            const status = document.getElementById('sys-status');
+            const slider = document.getElementById('rpmSlider');
+
+            if(isMotorRunning) {
+                btn.innerText = "Power OFF";
+                btn.classList.add('motor-on');
+                status.innerText = "OPERATIONAL";
+                status.className = "status-ok";
+                targetSpeed = (slider.value / 3000) * 0.3;
+            } else {
+                btn.innerText = "Power ON";
+                btn.classList.remove('motor-on');
+                status.innerText = "OFFLINE";
+                status.className = "status-off";
+                targetSpeed = 0;
+            }
+            postDriveToParent();
+        }
+
+        function updateSpeedDisplay(val) {
+            document.getElementById('rpm-val').innerText = val;
+            if(isMotorRunning) targetSpeed = (val / 3000) * 0.3;
+            postDriveToParent();
+        }
+
+        function toggleView() {
+            mainMotor.userData.isBlueprint = !mainMotor.userData.isBlueprint;
+            updateMaterials();
+            document.getElementById('bpBtn').classList.toggle('active-btn', mainMotor.userData.isBlueprint);
+        }
+
+        function toggleExplode() {
+            mainMotor.userData.isExploded = !mainMotor.userData.isExploded;
+            document.getElementById('explodeBtn').classList.toggle('active-btn', mainMotor.userData.isExploded);
+        }
+
+        function updateMaterials() {
+            mainMotor.traverse(c => {
+                if (c.isMesh && c.material !== outlineMat) {
+                    if (mainMotor.userData.isBlueprint) {
+                        c.material = new THREE.MeshBasicMaterial({ color: 0x00f2ff, wireframe: true, transparent: true, opacity: 0.3 });
+                    } else {
+                        c.material = materialsMap.get(c);
+                    }
+                }
+            });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            currentMotorSpeed = THREE.MathUtils.lerp(currentMotorSpeed, targetSpeed, 0.02);
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(mainMotor, true);
+            
+            if (intersects.length > 0) {
+                let hit = intersects[0].object;
+                if (hit.material === outlineMat) hit = hit.parent; 
+                if (hoveredObject !== hit) {
+                    if (hoveredObject && hoveredObject.userData.outline) hoveredObject.userData.outline.visible = false;
+                    hoveredObject = hit;
+                    if (hoveredObject.userData.outline) hoveredObject.userData.outline.visible = true;
+                }
+                tooltip.style.display = 'block';
+                tooltip.innerHTML = getDiagnosticHTML(hoveredObject);
+                document.body.style.cursor = 'pointer';
+            } else {
+                if (hoveredObject) {
+                    if (hoveredObject.userData.outline) hoveredObject.userData.outline.visible = false;
+                    hoveredObject = null;
+                }
+                tooltip.style.display = 'none';
+                document.body.style.cursor = 'default';
+            }
+
+            if (mainMotor) {
+                if(currentMotorSpeed > 0.0001) {
+                    rotationTime += currentMotorSpeed;
+                    mainMotor.traverse(c => {
+                        if (c.name === "active_part") {
+                            if(c.userData.id !== 'bearing' || c.userData.name.includes('INNER RACE')) {
+                                c.rotation.x += currentMotorSpeed;
+                            } else if (c.userData.name.includes('BALL')) {
+                                const currentAngle = c.userData.orbitAngle + rotationTime;
+                                c.position.y = Math.cos(currentAngle) * 0.9;
+                                c.position.z = Math.sin(currentAngle) * 0.9;
+                            }
+                        }
+                    });
+                }
+                
+                mainMotor.traverse(c => {
+                    if (originalPositions.has(c)) {
+                        let targetPos = originalPositions.get(c).clone();
+                        if (mainMotor.userData.isExploded) {
+                            const id = c.userData.id;
+                            if (id === 'box') targetPos.y += 8;
+                            if (id === 'bell' || id === 'coil') targetPos.x += (c.position.x > 0 ? 15 : -15);
+                            if (id === 'bearing' || id === 'b_cap') targetPos.x += (c.position.x > 0 ? 22 : -22);
+                            if (['fan', 'cover', 'shaft'].includes(id)) targetPos.x -= 25;
+                        }
+                        c.position.lerp(targetPos, 0.1);
+                    }
+                });
+            }
+
+            const dir = new THREE.Vector3();
+            camera.getWorldDirection(dir);
+            dir.y = 0; dir.normalize();
+            if (keys.w) camera.position.addScaledVector(dir, 0.5);
+            if (keys.s) camera.position.addScaledVector(dir, -0.5);
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            tooltip.style.left = (e.clientX + 20) + 'px';
+            tooltip.style.top = (e.clientY + 20) + 'px';
+        });
+
+        window.addEventListener('keydown', (e) => { if(keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = true; });
+        window.addEventListener('keyup', (e) => { if(keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = false; });
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
